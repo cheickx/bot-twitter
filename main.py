@@ -1,21 +1,24 @@
-import snscrape.modules.twitter as sntwitter
-import time
-import json
-import re
-import requests
-from googletrans import Translator
-from bs4 import BeautifulSoup
+import os
+import certifi
+os.environ['SSL_CERT_FILE'] = certifi.where()
 
-# === CONFIGURATION ===
-USERNAME = "ActuFoot_"  # Compte Twitter à surveiller
+import json
+import time
+import subprocess
+import requests
+import re
+from bs4 import BeautifulSoup
+from googletrans import Translator
+
+# Configuration
+USERNAME = "ActuFoot_"
 TELEGRAM_TOKEN = "8036416560:AAETLYeBRZe8w0bfpJujLNnJgG--kJqnsK8"
 TELEGRAM_CHAT_ID = "5249034734"
 SEEN_FILE = "seen.json"
-CHECK_INTERVAL = 30  # secondes
+CHECK_INTERVAL = 30  # en secondes
 
 translator = Translator()
 
-# === UTILITAIRES ===
 def clean_text(text):
     text = BeautifulSoup(text, "html.parser").get_text()
     text = re.sub(r"(NOUVEL ARTICLE|NEW ARTICLE)[\s:\-]*", "", text, flags=re.IGNORECASE)
@@ -24,17 +27,16 @@ def clean_text(text):
 
 def translate_text(text):
     try:
-        return translator.translate(text, dest='fr').text
+        return translator.translate(text, dest="fr").text
     except Exception as e:
         print(f"[!] Erreur de traduction : {e}")
         return text
 
 def load_seen():
-    try:
+    if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE, "r") as f:
             return set(json.load(f))
-    except FileNotFoundError:
-        return set()
+    return set()
 
 def save_seen(seen_ids):
     with open(SEEN_FILE, "w") as f:
@@ -59,19 +61,42 @@ def send_telegram_photo(image_url, caption):
     }
     requests.post(url, data=payload)
 
+def extract_image_url(content):
+    soup = BeautifulSoup(content, "html.parser")
+    img = soup.find("img")
+    if img and img.get("src"):
+        return img["src"]
+    return None
+
+def fetch_latest_tweet():
+    try:
+        result = subprocess.run(
+            ["snscrape", "--jsonl", f"twitter-user {USERNAME}"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode != 0:
+            raise Exception(result.stderr)
+        lines = result.stdout.strip().split("\n")
+        if lines:
+            return json.loads(lines[0])
+    except Exception as e:
+        print(f"[!] Erreur récupération tweet : {e}")
+    return None
+
 def process_tweet(tweet, seen_ids):
-    if tweet.id in seen_ids:
+    tweet_id = tweet["id"]
+    if tweet_id in seen_ids:
         return
 
-    cleaned = clean_text(tweet.content)
+    raw_text = tweet.get("content", "")
+    cleaned = clean_text(raw_text)
     translated = translate_text(cleaned)
 
-    # Image si disponible
     image_url = None
-    if tweet.media:
-        for media in tweet.media:
-            if hasattr(media, 'fullUrl'):
-                image_url = media.fullUrl
+    if tweet.get("media"):
+        for media in tweet["media"]:
+            if media.get("type") == "photo":
+                image_url = media.get("fullUrl")
                 break
 
     if image_url:
@@ -79,21 +104,19 @@ def process_tweet(tweet, seen_ids):
     else:
         send_telegram_message(translated)
 
-    seen_ids.add(tweet.id)
+    seen_ids.add(tweet_id)
     save_seen(seen_ids)
-    print(f"[+] Tweet envoyé : {translated[:60]}...")
+    print(f"[+] Nouveau tweet envoyé : {translated[:60]}...")
 
-# === BOUCLE PRINCIPALE ===
 def main():
-    seen_ids = load_seen()
     print("[*] Démarrage du bot avec snscrape...")
+    seen_ids = load_seen()
 
     while True:
         try:
-            tweets = list(sntwitter.TwitterUserScraper(USERNAME).get_items())
-            if tweets:
-                for tweet in reversed(tweets[:5]):  # Vérifie les 5 derniers tweets
-                    process_tweet(tweet, seen_ids)
+            tweet = fetch_latest_tweet()
+            if tweet:
+                process_tweet(tweet, seen_ids)
         except Exception as e:
             print(f"[!] Erreur dans la boucle principale : {e}")
         time.sleep(CHECK_INTERVAL)
